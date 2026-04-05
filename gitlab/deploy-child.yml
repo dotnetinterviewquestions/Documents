@@ -1,0 +1,21 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+    - when: never
+
+stages:
+  - deploy
+
+deploy-to-k8s:
+  stage: deploy
+  image: alpine/helm:3.17.0
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+  environment:
+    name: '$DEPLOY_ENV/$DEPLOY_REGION'
+  script:
+    - sh scripts/ci/helm_deploy.sh
+  artifacts:
+    when: always
+    paths:
+      - build/helm/*.yaml

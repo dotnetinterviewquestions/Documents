@@ -1,0 +1,112 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $PIPELINE_KIND == "deploy" && $CI_COMMIT_BRANCH == "develop"'
+    - when: never
+
+stages:
+  - verify
+  - package
+  - container
+  - deploy
+
+variables:
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false"
+  PIPELINE_KIND:
+    value: "build"
+    description: "Use 'deploy' when starting a manual deploy-only pipeline from the GitLab UI."
+  DEPLOY_ENV:
+    value: "uat1"
+    description: "Target environment slug for deploy-only pipelines, for example uat1, uat2, prod, or dr."
+  DEPLOY_REGION:
+    value: "amer"
+    description: "Target region slug for deploy-only pipelines, for example amer, emea, or apac."
+  DEPLOY_IMAGE_TAG:
+    value: ""
+    description: "Container image tag to deploy, usually a Git commit SHA already pushed to the registry."
+  DEPLOY_VALUES_FILE:
+    value: ""
+    description: "Optional override for the Helm values file. Default: k8s/helm/atlas-execution-processor/values-<env>-<region>.yaml"
+  HELM_RELEASE_PREFIX:
+    value: "aep"
+    description: "Prefix used to build the Helm release name. Default release name: <prefix>-<env>-<region>."
+  KUBE_NAMESPACE_PREFIX:
+    value: "aep"
+    description: "Prefix used to build the Kubernetes namespace. Default namespace: <prefix>-<env>-<region>."
+  HELM_TIMEOUT:
+    value: "10m"
+    description: "Helm wait timeout for deploy-only pipelines."
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .gradle/wrapper
+    - .gradle/caches
+
+verify:
+  stage: verify
+  image: gradle:8.14.2-jdk21
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  script:
+    - ./gradlew --no-daemon clean test jacocoTestReport jacocoTestCoverageVerification
+  artifacts:
+    when: always
+    reports:
+      junit: pvsone/core/servers/atlas-execution-processor/build/test-results/test/*.xml
+      coverage_report:
+        coverage_format: jacoco
+        path: pvsone/core/servers/atlas-execution-processor/build/reports/jacoco/test/jacocoTestReport.xml
+    paths:
+      - pvsone/core/servers/atlas-execution-processor/build/reports/
+      - pvsone/core/servers/atlas-execution-processor/build/test-results/
+
+package:
+  stage: package
+  image: gradle:8.14.2-jdk21
+  needs:
+    - job: verify
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  script:
+    - ./gradlew --no-daemon :pvsone:core:servers:atlas-execution-processor:bootJar
+  artifacts:
+    paths:
+      - pvsone/core/servers/atlas-execution-processor/build/libs/*.jar
+
+container:
+  stage: container
+  image: docker:27
+  needs:
+    - job: package
+      artifacts: true
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - if [ "$CI_COMMIT_BRANCH" = "develop" ]; then docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" "$CI_REGISTRY_IMAGE:develop"; docker push "$CI_REGISTRY_IMAGE:develop"; fi
+    - if [ -n "$CI_COMMIT_TAG" ]; then docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA" "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"; docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"; fi
+
+deploy-child-pipeline:
+  stage: deploy
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $PIPELINE_KIND == "deploy" && $CI_COMMIT_BRANCH == "develop"'
+  trigger:
+    include:
+      - local: .gitlab/deploy-child.yml
+    strategy: depend
+    forward:
+      pipeline_variables: true
